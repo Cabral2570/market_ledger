@@ -13,6 +13,7 @@
 - My read: the whisper is INFLATED — the market has already paid for part of this
   report in advance. A small beat may not be enough.
 - Report day pre-market: ~-3% — part of yesterday's pre-payment already being given back BEFORE the report.
+- Additional factor: Amazon reports the same afternoon; AWS's comments on capital spending could influence SNDK out of sympathy.
 
 ## Scenarios and my predicted reaction (next trading day)
 
