@@ -1,0 +1,124 @@
+name: "01 - OpenTimestamps Auto-Stamp"
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - "memos/**"
+      - "theses/**"
+      - "audit-log/**"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ots-timestamps
+  cancel-in-progress: false
+
+jobs:
+  stamp:
+    if: github.actor != 'github-actions[bot]' && !startsWith(github.event.head_commit.message, '[OTS-Auto]')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install OpenTimestamps client
+        run: pip install --quiet opentimestamps-client
+
+      - name: Verify audit-log integrity and ensure no memos or theses were deleted
+        run: |
+          set -euo pipefail
+          mkdir -p memos theses audit-log
+          VIOLATIONS=0
+
+          while IFS= read -r -d '' ots_file; do
+            manifest_file="${ots_file%.ots}"
+            if [ ! -f "$manifest_file" ]; then
+              echo "::error::Audit manifest was deleted: $manifest_file"
+              VIOLATIONS=$((VIOLATIONS + 1))
+              continue
+            fi
+
+            expected_hash=$(ots info "$ots_file" | awk '/^File sha256 hash:/ {print $4}')
+            actual_hash=$(sha256sum "$manifest_file" | awk '{print $1}')
+
+            if [ "$expected_hash" != "$actual_hash" ]; then
+              echo "::error file=$manifest_file::Audit manifest was modified after stamping: $manifest_file"
+              VIOLATIONS=$((VIOLATIONS + 1))
+            fi
+          done < <(find audit-log -type f -name "*.ots" -print0)
+
+          latest_manifest=$(find audit-log -maxdepth 1 -type f -name "*.txt" | sort | tail -n 1 || true)
+          if [ -n "$latest_manifest" ]; then
+            while IFS= read -r prev_entry; do
+              [ -z "$prev_entry" ] && continue
+              if [ ! -f "$prev_entry" ]; then
+                echo "::error::Previously published file was deleted: $prev_entry (violates no-deletion rule)."
+                VIOLATIONS=$((VIOLATIONS + 1))
+              fi
+            done < <(awk '/^=== LEDGER SHA-256 SNAPSHOT ===/{flag=1; next} flag && NF>=2 {sub(/^[0-9a-f]+[[:space:]]+/, ""); print}' "$latest_manifest")
+          fi
+
+          if [ "$VIOLATIONS" -gt 0 ]; then
+            echo "Found $VIOLATIONS integrity violation(s). Aborting."
+            exit 1
+          fi
+          echo "Integrity check passed."
+
+      - name: Generate and stamp commit manifest in audit-log/
+        run: |
+          set -euo pipefail
+          FILE_COUNT=$(find memos theses -type f ! -name ".gitkeep" ! -name ".DS_Store" | wc -l | tr -d ' ')
+
+          if [ "$FILE_COUNT" -eq 0 ]; then
+            echo "No files in memos/ or theses/ yet. Skipping stamp."
+            exit 0
+          fi
+
+          COMMIT_SHA=$(git rev-parse HEAD)
+          SHORT_SHA=$(git rev-parse --short=10 HEAD)
+          PARENT_SHA=$(git rev-parse HEAD^ 2>/dev/null || echo "INITIAL_COMMIT")
+          UTC_SLUG=$(date -u +"%Y-%m-%dT%H-%M-%SZ")
+          UTC_TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          MANIFEST="audit-log/${UTC_SLUG}_${SHORT_SHA}.txt"
+
+          {
+            echo "=== MARKET_LEDGER AUDIT MANIFEST ==="
+            echo "UTC_TIMESTAMP: $UTC_TS"
+            echo "GIT_COMMIT:    $COMMIT_SHA"
+            echo "GIT_PARENT:    $PARENT_SHA"
+            echo ""
+            echo "=== LEDGER SHA-256 SNAPSHOT ==="
+            find memos theses -type f ! -name ".gitkeep" ! -name ".DS_Store" -print0 | sort -z | xargs -0 sha256sum
+          } > "$MANIFEST"
+
+          echo "Stamping manifest: $MANIFEST"
+          ots stamp "$MANIFEST"
+
+      - name: Commit and push .ots proof
+        run: |
+          set -euo pipefail
+          find audit-log -type f -name "*.ots.bak" -delete
+
+          if [ -z "$(git status --porcelain audit-log/)" ]; then
+            echo "Nothing new in audit-log/ to commit."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add audit-log/
+          git commit -m "[OTS-Auto] Stamp commit manifest in OpenTimestamps [skip ci]"
+          git pull --rebase origin main
+          git push origin main
